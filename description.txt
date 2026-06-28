@@ -1,1 +1,5 @@
-Modify this file with a description of your mod.
+a mod to stars80 keyboard light up when you get hurt in the game
+!!warning it wont work on a stock stars80 keyboard!!
+
+get this firmware first->>>
+https://github.com/DavidixGT/MyStars80Keyboard
