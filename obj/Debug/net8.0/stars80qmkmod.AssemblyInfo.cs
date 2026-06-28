@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("stars80qmkmod")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+3f05278f78fe28608cbe3488975615d8f18d1b95")]
 [assembly: System.Reflection.AssemblyProductAttribute("stars80qmkmod")]
 [assembly: System.Reflection.AssemblyTitleAttribute("stars80qmkmod")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
