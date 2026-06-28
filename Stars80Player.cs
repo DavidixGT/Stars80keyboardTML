@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 using Terraria;
 using Terraria.ModLoader;
 
@@ -6,27 +7,27 @@ namespace stars80qmkmod
 {
     public class Stars80Player : ModPlayer
     {
-        // 60 frames = exactly 1 second at standard 60FPS
         private const int MaxFlashDuration = 60; 
         private int _flashTimer = 0;
         private bool _isFadingActive = false;
 
-        // Triggers the exact frame your character takes damage
+        private static readonly object ColorLock = new object();
+        private static byte _targetR, _targetG, _targetB;
+        private static bool _isWorkerRunning = false;
+
         public override void OnHurt(Player.HurtInfo info)
         {
             if (Main.dedServ || !OperatingSystem.IsWindows()) return;
 
-            // Start or refresh the 1-second countdown clock
             _flashTimer = MaxFlashDuration;
             _isFadingActive = true;
 
-            // Hit frame: Instantly jump to full, solid red (255, 0, 0)
-            Stars80ModSystem.SetEntireKeyboardColor(255, 0, 0);
+            UpdateSharedColor(255, 0, 0);
+            EnsureWorkerIsRunning();
         }
 
         public override void PostUpdate()
         {
-            // Only execute if we are actively tracking an injury event inside a live world session
             if (Main.dedServ || Main.gameMenu || !Player.active || !_isFadingActive) 
                 return;
 
@@ -34,21 +35,84 @@ namespace stars80qmkmod
 
             if (_flashTimer > 0)
             {
-                // Calculate the fading ratio percentage (starts at 1.0 down to 0.0)
                 double fadeRatio = (double)_flashTimer / MaxFlashDuration;
-
-                // Linearly scale down the Red value based on the remaining time ratio
                 byte currentRed = (byte)(fadeRatio * 255);
-
-                // Continuously update the keyboard using your lightning-fast 17-packet batch API
-                Stars80ModSystem.SetEntireKeyboardColor(currentRed, 0, 0);
+                UpdateSharedColor(currentRed, 0, 0);
             }
             else
             {
-                // Force a single absolute blackout check on the final clock tick frame
-                Stars80ModSystem.ClearAllKeys();
+                UpdateSharedColor(0, 0, 0);
                 _isFadingActive = false;
             }
+        }
+
+        private static void UpdateSharedColor(byte r, byte g, byte b)
+        {
+            lock (ColorLock)
+            {
+                _targetR = r;
+                _targetG = g;
+                _targetB = b;
+            }
+        }
+
+        private static void EnsureWorkerIsRunning()
+        {
+            lock (ColorLock)
+            {
+                if (_isWorkerRunning) return;
+                _isWorkerRunning = true;
+            }
+
+            Task.Run(async () =>
+            {
+                try
+                {
+                    bool keepRunning = true;
+                    byte lastSentR = 255, lastSentG = 255, lastSentB = 255;
+
+                    while (keepRunning)
+                    {
+                        byte r, g, b;
+                        lock (ColorLock)
+                        {
+                            r = _targetR;
+                            g = _targetG;
+                            b = _targetB;
+                        }
+
+                        // Only write if values actually changed to completely eliminate redundant USB usage
+                        if (r != lastSentR || g != lastSentG || b != lastSentB)
+                        {
+                            // Await non-blocking asynchronous Windows I/O operation
+                            await Stars80ModSystem.SetEntireKeyboardColorAsync(r, g, b).ConfigureAwait(false);
+                            lastSentR = r;
+                            lastSentG = g;
+                            lastSentB = b;
+                        }
+
+                        if (r == 0 && g == 0 && b == 0)
+                        {
+                            lock (ColorLock)
+                            {
+                                if (_targetR == 0 && _targetG == 0 && _targetB == 0)
+                                {
+                                    _isWorkerRunning = false;
+                                    keepRunning = false;
+                                }
+                            }
+                        }
+
+                        // Increased delay to 40ms (~25 FPS update rate) 
+                        // This matches the physiological fusion frequency for custom keyboard fade effects perfectly!
+                        await Task.Delay(40).ConfigureAwait(false);
+                    }
+                }
+                catch
+                {
+                    lock (ColorLock) { _isWorkerRunning = false; }
+                }
+            });
         }
     }
 }

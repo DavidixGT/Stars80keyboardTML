@@ -1,5 +1,8 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 using Terraria;
 using Terraria.ModLoader;
@@ -12,13 +15,13 @@ namespace stars80qmkmod
         private const ushort ProductId = 0xE401;
         private const ushort UsagePage = 0xFF60;
         private const ushort Usage = 0x61;
-        private const int ReportLength = 32;
 
         private const uint GENERIC_READ = 0x80000000;
         private const uint GENERIC_WRITE = 0x40000000;
         private const uint FILE_SHARE_READ = 0x00000001;
         private const uint FILE_SHARE_WRITE = 0x00000002;
         private const uint OPEN_EXISTING = 3;
+        private const uint FILE_FLAG_OVERLAPPED = 0x40000000; // CRITICAL: Enables true async kernel I/O
         private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
 
         public static readonly int[][] LayoutMap = new int[][]
@@ -26,96 +29,149 @@ namespace stars80qmkmod
             new int[] {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16},
             new int[] {33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17},
             new int[] {34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50},
-            new int[] {64, 63, 62, 61, 60, 59, 58, 57, 56, 55, 54, 53, 52, 51, 49, 49, 50},
-            new int[] {65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 76, 77, 77, 77, 77},
-            new int[] {85, 85, 85, 84, 83, 83, 83, 83, 83, 82, 81, 80, 80, 79, 78, 78, 78}
+            new int[] {64, 63, 62, 61, 60, 59, 58, 57, 56, 55, 54, 53, 52, 51, 52, 53, 54}, 
+            new int[] {65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81},
+            new int[] {85, 86, 87, 84, 83, 88, 89, 90, 91, 82, 92, 93, 94, 95, 96, 97, 98}
         };
 
+        private static readonly List<int> FlattenedUniqueKeys = new List<int>();
         public static SafeFileHandle DeviceHandle = null;
+        private static FileStream DeviceStream = null; // .NET wrapper for lightning-fast async I/O
+
+        // Pre-allocated static buffers to avoid GC allocations during active gameplay fades
+        private static readonly List<byte[]> PreallocatedPackets = new List<byte[]>();
 
         public override void OnModLoad()
         {
             if (Main.dedServ || !OperatingSystem.IsWindows()) return;
+            
+            FlattenedUniqueKeys.Clear();
+            HashSet<int> seen = new HashSet<int>();
+            for (int row = 0; row < LayoutMap.Length; row++)
+            {
+                for (int col = 0; col < LayoutMap[row].Length; col++)
+                {
+                    int key = LayoutMap[row][col];
+                    if (seen.Add(key)) 
+                    {
+                        FlattenedUniqueKeys.Add(key);
+                    }
+                }
+            }
+
+            // Pre-calculate packets structure layout frames shape once on game boot
+            PreallocatedPackets.Clear();
+            int totalKeys = FlattenedUniqueKeys.Count;
+            int index = 0;
+            while (index < totalKeys)
+            {
+                byte[] packet = new byte[33];
+                packet[1] = 0x02; // Batch update token command index descriptor
+                int keysInThisPacket = Math.Min(6, totalKeys - index);
+                packet[2] = (byte)keysInThisPacket;
+
+                int byteOffset = 3;
+                for (int i = 0; i < keysInThisPacket; i++)
+                {
+                    packet[byteOffset] = (byte)FlattenedUniqueKeys[index++];
+                    byteOffset += 4; // Colors will safely override offsets 1,2,3 dynamically later
+                }
+                PreallocatedPackets.Add(packet);
+            }
+
             DeviceHandle = FindAndOpenStars80();
+            if (DeviceHandle != null && !DeviceHandle.IsInvalid)
+            {
+                // Create a managed stream that uses pure underlying Windows Overlapped I/O
+                DeviceStream = new FileStream(DeviceHandle, FileAccess.ReadWrite, 33, true);
+            }
         }
 
         public override void OnModUnload()
         {
+            if (DeviceStream != null)
+            {
+                ClearAllKeysSync(); // Quick clean shutdown sequence injection
+                DeviceStream.Dispose();
+                DeviceStream = null;
+            }
             if (DeviceHandle != null && !DeviceHandle.IsInvalid && !DeviceHandle.IsClosed)
             {
-                ClearAllKeys();
-                System.Threading.Thread.Sleep(5); 
                 DeviceHandle.Dispose();
+                DeviceHandle = null;
             }
         }
+        private static readonly byte[] SingleKeyPayload = new byte[33];
+private static readonly object SingleKeyLock = new object();
 
-public static void SetKeyColor(int ledIndex, byte r, byte g, byte b)
+public static async Task SetKeyColorAsync(int ledIndex, byte r, byte g, byte b)
 {
-    if (DeviceHandle == null || DeviceHandle.IsInvalid || DeviceHandle.IsClosed) return;
+    if (DeviceStream == null || !DeviceStream.CanWrite) return;
 
-    // FIX: Expand array length to 33 bytes. Index 0 remains 0x00 (The Windows HID Report ID)
-    byte[] payload = new byte[33]; 
-    payload[1] = 0x02;        // Command shifted to Index 1: Batch Update
-    payload[2] = 1;           // Shifted to Index 2: Total keys inside packet
-    payload[3] = (byte)ledIndex; // Shifted to Index 3: Targeted Key Index
-    payload[4] = g;           // Shifted to Index 4: Set R
-    payload[5] = r;           // Shifted to Index 5: Set G
-    payload[6] = b;           // Shifted to Index 6: Set B
-
-    uint bytesWritten;
-    WriteFile(DeviceHandle, payload, (uint)payload.Length, out bytesWritten, IntPtr.Zero);
-}
-
-
-public static void ClearAllKeys()
-{
-    // Simply fire the batch loop with zeros to instantly clear the whole board
-    SetEntireKeyboardColor(0, 0, 0);
-}
-
-public static void SetEntireKeyboardColor(byte r, byte g, byte b)
-{
-    if (DeviceHandle == null || DeviceHandle.IsInvalid || DeviceHandle.IsClosed) return;
-
-    // Flatten our 2D Layout Map into a clean list of all unique keys
-    System.Collections.Generic.List<int> allKeys = new System.Collections.Generic.List<int>();
-    for (int row = 0; row < 6; row++)
+    // Use a lock to ensure multi-threaded calls do not overwrite the single buffer simultaneously
+    lock (SingleKeyLock)
     {
-        for (int col = 0; col < 17; col++)
-        {
-            allKeys.Add(LayoutMap[row][col]);
-        }
+        SingleKeyPayload[1] = 0x02;            // Command: Batch/Single Update
+        SingleKeyPayload[2] = 1;               // Total keys inside packet (1)
+        SingleKeyPayload[3] = (byte)ledIndex;  // Targeted Key Index
+        SingleKeyPayload[4] = g;               // Corrected RGB mapping
+        SingleKeyPayload[5] = r;               
+        SingleKeyPayload[6] = b;               
     }
 
-    // Process keys in batches of 6 keys per USB report packet
-    int totalKeys = allKeys.Count;
-    int index = 0;
-
-    while (index < totalKeys)
+    try
     {
-        // 33-byte buffer. Index 0 is 0x00 (Windows HID Report ID)
-        byte[] payload = new byte[33];
-        payload[1] = 0x02; // Command: Batch Update
-
-        // Calculate how many keys are left for this specific packet (max 6)
-        int keysInThisPacket = Math.Min(6, totalKeys - index);
-        payload[2] = (byte)keysInThisPacket;
-
-        int byteOffset = 3;
-        for (int i = 0; i < keysInThisPacket; i++)
-        {
-            payload[byteOffset] = (byte)allKeys[index++]; // Key Index location
-            payload[byteOffset + 1] = g;                  // R
-            payload[byteOffset + 2] = r;                  // G
-            payload[byteOffset + 3] = b;                  // B
-            byteOffset += 4; // Move to next key segment inside the packet
-        }
-
-        uint bytesWritten;
-        WriteFile(DeviceHandle, payload, (uint)payload.Length, out bytesWritten, IntPtr.Zero);
+        // Sends the single packet instantly to the OS kernel without stalling the game thread
+        await DeviceStream.WriteAsync(SingleKeyPayload, 0, SingleKeyPayload.Length).ConfigureAwait(false);
+        await DeviceStream.FlushAsync().ConfigureAwait(false);
     }
+    catch { /* Device disconnected gracefully or busy */ }
 }
 
+        // True non-blocking asynchronous hardware push method call
+        public static async Task SetEntireKeyboardColorAsync(byte r, byte g, byte b)
+        {
+            if (DeviceStream == null || !DeviceStream.CanWrite) return;
+
+            try
+            {
+                foreach (var packet in PreallocatedPackets)
+                {
+                    int keysInThisPacket = packet[2];
+                    int byteOffset = 3;
+                    for (int i = 0; i < keysInThisPacket; i++)
+                    {
+                        packet[byteOffset + 1] = g; // Update live target calculations smoothly
+                        packet[byteOffset + 2] = r;
+                        packet[byteOffset + 3] = b;
+                        byteOffset += 4;
+                    }
+
+                    // Sends packets instantly to kernel without stalling any game engine worker loops
+                    await DeviceStream.WriteAsync(packet, 0, packet.Length).ConfigureAwait(false);
+                }
+                await DeviceStream.FlushAsync().ConfigureAwait(false);
+            }
+            catch { /* Device disconnected gracefully or busy */ }
+        }
+
+        private static void ClearAllKeysSync()
+        {
+            if (DeviceHandle == null || DeviceHandle.IsInvalid || DeviceHandle.IsClosed) return;
+            foreach (var packet in PreallocatedPackets)
+            {
+                int keysInThisPacket = packet[2];
+                int byteOffset = 3;
+                for (int i = 0; i < keysInThisPacket; i++)
+                {
+                    packet[byteOffset + 1] = 0;
+                    packet[byteOffset + 2] = 0;
+                    packet[byteOffset + 3] = 0;
+                    byteOffset += 4;
+                }
+                WriteFile(DeviceHandle, packet, (uint)packet.Length, out _, IntPtr.Zero);
+            }
+        }
 
         private static SafeFileHandle FindAndOpenStars80()
         {
@@ -144,32 +200,28 @@ public static void SetEntireKeyboardColor(byte r, byte g, byte b)
                         IntPtr pathPtr = new IntPtr(detailBuffer.ToInt64() + 4);
                         string devicePath = Marshal.PtrToStringUni(pathPtr);
 
-                        SafeFileHandle handle = CreateFile(devicePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+                        // Modded to pass FILE_FLAG_OVERLAPPED to prevent driver thread locking issues
+                        SafeFileHandle handle = CreateFile(devicePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
                         if (!handle.IsInvalid)
                         {
-                            HIDD_ATTRIBUTES attributes = new HIDD_ATTRIBUTES();
-                            attributes.Size = Marshal.SizeOf(attributes);
+                            HIDD_ATTRIBUTES attributes = new HIDD_ATTRIBUTES { Size = Marshal.SizeOf(typeof(HIDD_ATTRIBUTES)) };
 
-                            if (HidD_GetAttributes(handle, ref attributes))
+                            if (HidD_GetAttributes(handle, ref attributes) && attributes.VendorID == VendorId && attributes.ProductID == ProductId)
                             {
-                                if (attributes.VendorID == VendorId && attributes.ProductID == ProductId)
+                                if (HidD_GetPreparsedData(handle, out IntPtr preparsedData))
                                 {
-                                    IntPtr preparsedData;
-                                    if (HidD_GetPreparsedData(handle, out preparsedData))
-                                    {
-                                        HIDP_CAPS caps;
-                                        HidP_GetCaps(preparsedData, out caps);
-                                        HidD_FreePreparsedData(preparsedData);
+                                    HIDP_CAPS caps;
+                                    int status = HidP_GetCaps(preparsedData, out caps);
+                                    HidD_FreePreparsedData(preparsedData);
 
-                                        if (caps.UsagePage == UsagePage && caps.Usage == Usage)
-                                        {
-                                            SetupDiDestroyDeviceInfoList(deviceInfoSet);
-                                            return handle;
-                                        }
+                                    if (status == 0x00110000 && caps.UsagePage == UsagePage && caps.Usage == Usage)
+                                    {
+                                        SetupDiDestroyDeviceInfoList(deviceInfoSet);
+                                        return handle;
                                     }
                                 }
                             }
-                            handle.Dispose();
+                            handle.Dispose(); 
                         }
                     }
                 }
@@ -179,6 +231,7 @@ public static void SetEntireKeyboardColor(byte r, byte g, byte b)
             SetupDiDestroyDeviceInfoList(deviceInfoSet);
             return null;
         }
+
 
         #region Native Win32 API Imports
 
